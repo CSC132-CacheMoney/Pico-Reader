@@ -66,12 +66,14 @@ CMD_SOFT_RESET     = 0x0F
 PICC_REQIDL        = 0x26
 PICC_REQALL        = 0x52
 PICC_ANTICOLL      = 0x93
+PICC_ANTICOLL2     = 0x95   # cascade level 2
 PICC_SELECT_TAG    = 0x93
 PICC_AUTH_KEY_A    = 0x60
 PICC_READ          = 0x30
 PICC_WRITE         = 0xA0
 PICC_HALT          = 0x50
 MIFARE_ACK         = 0x0A
+NTAG_WRITE         = 0xA2   # NTAG213/215/216 page write (4 bytes)
 
 MI_OK              = 0
 MI_NO_TAG          = 1
@@ -254,6 +256,17 @@ class RC522:
             return MI_ERR
         return MI_OK
 
+    def ntag_write_page(self, page, data4):
+        """Write exactly 4 bytes to an NTAG213/215/216 page."""
+        if len(data4) != 4:
+            return MI_ERR
+        buf = [NTAG_WRITE, page] + list(data4)
+        buf += self._calc_crc(buf)
+        status, back = self._transceive(buf)
+        if status != MI_OK or len(back) < 1 or (back[0] & 0x0F) != MIFARE_ACK:
+            return MI_ERR
+        return MI_OK
+
     def halt(self):
         buf = [PICC_HALT, 0x00]
         buf += self._calc_crc(buf)
@@ -277,16 +290,65 @@ def _sector_of(block):
 def _first_block_of_sector(sector):
     return sector * 4
 
+def _select_card(reader):
+    """
+    Anticollision + SELECT for both 4-byte (single) and 7-byte (double cascade) UIDs.
+    Returns (MI_OK, uid, sak) or (MI_ERR, None, None).
+    NTAG213/215/216 use a 7-byte UID — first SELECT returns SAK=0x04 (cascade),
+    requiring a second level before we get the real SAK=0x00.
+    """
+    # ── Cascade level 1 (sel = 0x93) ─────────────────────────────
+    reader._write(REG_BIT_FRAMING, 0x00)
+    status, back = reader._transceive([PICC_ANTICOLL, 0x20])
+    if status != MI_OK or not back or len(back) != 5:
+        return MI_ERR, None, None
+    chk = 0
+    for b in back[:4]:
+        chk ^= b
+    if chk != back[4]:
+        return MI_ERR, None, None
+    uid1 = back  # [B0, B1, B2, B3, BCC]
+
+    buf = [PICC_SELECT_TAG, 0x70] + uid1
+    buf += reader._calc_crc(buf)
+    status, back = reader._transceive(buf)
+    if status != MI_OK or not back or len(back) < 1:
+        return MI_ERR, None, None
+    sak = back[0]
+
+    if not (sak & 0x04):
+        # Single-size UID complete — MIFARE Classic lands here
+        return MI_OK, uid1[:4], sak
+
+    # ── Cascade level 2 (sel = 0x95) — needed for 7-byte UIDs ───
+    reader._write(REG_BIT_FRAMING, 0x00)
+    status, back = reader._transceive([PICC_ANTICOLL2, 0x20])
+    if status != MI_OK or not back or len(back) != 5:
+        return MI_ERR, None, None
+    chk = 0
+    for b in back[:4]:
+        chk ^= b
+    if chk != back[4]:
+        return MI_ERR, None, None
+    uid2 = back  # [B3, B4, B5, B6, BCC]
+
+    buf = [PICC_ANTICOLL2, 0x70] + uid2
+    buf += reader._calc_crc(buf)
+    status, back = reader._transceive(buf)
+    if status != MI_OK or not back or len(back) < 1:
+        return MI_ERR, None, None
+    sak = back[0]  # final SAK — 0x00 for NTAG213/215/216
+
+    # Full 7-byte UID: skip CT (0x88) from level 1, skip BCC from both
+    full_uid = uid1[1:4] + uid2[:4]
+    return MI_OK, full_uid, sak
+
 def handle_scan(reader):
     status, _ = reader.request(PICC_REQIDL)
     if status != MI_OK:
         _send({"status": "no_tag"})
         return
-    status, uid = reader.anticoll()
-    if status != MI_OK:
-        _send({"status": "error", "msg": "anticoll failed"})
-        return
-    status, sak = reader.select_tag(uid)
+    status, uid, sak = _select_card(reader)
     if status != MI_OK:
         _send({"status": "error", "msg": "select failed"})
         return
@@ -300,22 +362,30 @@ def handle_read(reader, block, key=None):
     if status != MI_OK:
         _send({"status": "no_tag"})
         return
-    status, uid = reader.anticoll()
+    status, uid, sak = _select_card(reader)
     if status != MI_OK:
-        _send({"status": "error", "msg": "anticoll failed"})
+        reader.halt()
+        _send({"status": "error", "msg": "select failed"})
         return
-    reader.select_tag(uid)
-    sector = _sector_of(block)
-    trailer = _first_block_of_sector(sector) + 3
-    status = reader.auth(PICC_AUTH_KEY_A, trailer, key, uid)
-    if status != MI_OK:
+
+    if sak == 0x00:
+        # NTAG213/215/216 or MIFARE Ultralight — no sector auth needed
+        status, data = reader.read_block(block)  # PICC_READ returns 16 bytes on NTAG too
+        reader.halt()
+    else:
+        # MIFARE Classic — authenticate sector first
+        sector = _sector_of(block)
+        trailer = _first_block_of_sector(sector) + 3
+        status = reader.auth(PICC_AUTH_KEY_A, trailer, key, uid)
+        if status != MI_OK:
+            reader.stop_crypto()
+            reader.halt()
+            _send({"status": "error", "msg": "auth failed"})
+            return
+        status, data = reader.read_block(block)
         reader.stop_crypto()
         reader.halt()
-        _send({"status": "error", "msg": "auth failed"})
-        return
-    status, data = reader.read_block(block)
-    reader.stop_crypto()
-    reader.halt()
+
     if status == MI_OK:
         _send({"status": "ok", "block": block, "data": data, "uid": uid})
     else:
@@ -331,26 +401,39 @@ def handle_write(reader, block, data, key=None):
     if status != MI_OK:
         _send({"status": "no_tag"})
         return
-    status, uid = reader.anticoll()
+    status, uid, sak = _select_card(reader)
     if status != MI_OK:
-        _send({"status": "error", "msg": "anticoll failed"})
-        return
-    reader.select_tag(uid)
-    sector = _sector_of(block)
-    trailer = _first_block_of_sector(sector) + 3
-    status = reader.auth(PICC_AUTH_KEY_A, trailer, key, uid)
-    if status != MI_OK:
-        reader.stop_crypto()
         reader.halt()
-        _send({"status": "error", "msg": "auth failed"})
+        _send({"status": "error", "msg": "select failed"})
         return
-    status = reader.write_block(block, data)
-    reader.stop_crypto()
-    reader.halt()
-    if status == MI_OK:
+
+    if sak == 0x00:
+        # NTAG213/215/216 — write 4 pages of 4 bytes each (no auth needed)
+        for i in range(4):
+            status = reader.ntag_write_page(block + i, data[i*4:(i+1)*4])
+            if status != MI_OK:
+                reader.halt()
+                _send({"status": "error", "msg": "write failed at page " + str(block + i)})
+                return
+        reader.halt()
         _send({"status": "ok", "block": block, "uid": uid})
     else:
-        _send({"status": "error", "msg": "write failed"})
+        # MIFARE Classic — authenticate sector first
+        sector = _sector_of(block)
+        trailer = _first_block_of_sector(sector) + 3
+        status = reader.auth(PICC_AUTH_KEY_A, trailer, key, uid)
+        if status != MI_OK:
+            reader.stop_crypto()
+            reader.halt()
+            _send({"status": "error", "msg": "auth failed"})
+            return
+        status = reader.write_block(block, data)
+        reader.stop_crypto()
+        reader.halt()
+        if status == MI_OK:
+            _send({"status": "ok", "block": block, "uid": uid})
+        else:
+            _send({"status": "error", "msg": "write failed"})
 
 def main():
     reader = RC522(
@@ -361,7 +444,7 @@ def main():
         cs=PIN_CS,
         rst=PIN_RST,
     )
-    _send({"Cache Money RFID Reader: \nstatus": "ready", "version": hex(reader.version)})
+    _send({"status": "ready", "msg": "Cache Money RFID Reader", "version": hex(reader.version)})
 
     buf = ""
     while True:
